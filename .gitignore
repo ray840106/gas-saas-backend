@@ -1,0 +1,19 @@
+# 📦 1. 依賴套件 (絕對不能推上雲端，太大了！Render 會自己重新安裝)
+node_modules/
+
+# 🔑 2. 環境變數與機密金鑰 (超重要！保護你的 LINE 與 Supabase 密碼)
+.env
+.env.local
+.env.*
+
+# 📜 3. 系統與錯誤日誌檔
+npm-debug.log*
+yarn-error.log*
+yarn-debug.log*
+*.log
+
+# 🍎 4. Mac 系統自動產生的隱藏垃圾檔 (用 Mac 開發必加)
+.DS_Store
+
+# ⚙️ 5. 其他編輯器設定檔 (例如 VS Code 的設定)
+.vscode/
