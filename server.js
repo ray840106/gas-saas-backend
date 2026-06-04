@@ -156,6 +156,29 @@ app.post('/api/order', async (req, res) => {
   }
 });
 
+// 取得所有瓦斯訂單 (從新到舊排序)
+app.get('/api/orders', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('orders')
+      .select('*')
+      .order('created_at', { ascending: false }); // 讓最新建立的訂單排在最上面
+
+    // 如果 Supabase 報錯
+    if (error) {
+      console.error('Supabase 撈取訂單失敗:', error);
+      return res.status(500).json({ success: false, message: error.message });
+    }
+
+    // 成功回傳資料
+    res.json({ success: true, data: data });
+    
+  } catch (err) {
+    console.error('伺服器錯誤:', err);
+    res.status(500).json({ success: false, message: '伺服器內部錯誤' });
+  }
+});
+
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`🚀 瓦斯行後端 API 伺服器啟動於 port ${port}`);
