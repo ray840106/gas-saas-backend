@@ -179,6 +179,11 @@ app.get('/api/orders', async (req, res) => {
   }
 });
 
+// 🚚 4. 送貨路線規劃 API（給師傅用：排最佳路徑 + Google 導航）
+//    掛在 express.json() 之後，才能正確解析前端傳來的 JSON
+const { createDeliveryRouter } = require('./src/routes/delivery');
+app.use('/api/delivery', createDeliveryRouter(supabase));
+
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`🚀 瓦斯行後端 API 伺服器啟動於 port ${port}`);

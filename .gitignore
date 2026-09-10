@@ -5,6 +5,7 @@ node_modules/
 .env
 .env.local
 .env.*
+!.env.example
 
 # 📜 3. 系統與錯誤日誌檔
 npm-debug.log*
