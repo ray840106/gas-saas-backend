@@ -17,6 +17,26 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 // 訂單資料表名稱集中在這裡，避免寫入與讀取指到不同張表
 const ORDER_TABLE = 'gas_order';
 
+const ORDER_STATUSES = ['pending', 'delivering', 'completed'];
+
+// gas_order.status 的欄位預設值連同單引號一起存成 'pending'，
+// 比對前一律先正規化，否則 status 的判斷全部會失準。
+function normalizeStatus(value) {
+  const text = String(value ?? '').trim().replace(/^'(.*)'$/, '$1').trim();
+  return ORDER_STATUSES.includes(text) ? text : 'pending';
+}
+
+// Google Maps 導航連結。用的是免費的 Maps URLs 格式，
+// 不需要 API key、不需要開通帳單，地址直接用字串讓 Google 自己解析。
+function mapsUrlFor(address) {
+  return 'https://www.google.com/maps/dir/?api=1&travelmode=driving&destination=' +
+    encodeURIComponent(address);
+}
+
+// 一條 Maps 連結能塞的中繼點上限。
+// ⚠️ 這個數字請對照 Google Maps URLs 官方文件確認，超過的部分會被截斷。
+const MAX_WAYPOINTS = 9;
+
 // 2. LINE 金鑰設定
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
@@ -176,6 +196,118 @@ app.get('/api/orders', async (req, res) => {
     // 成功回傳資料
     res.json({ success: true, data: data });
     
+  } catch (err) {
+    console.error('伺服器錯誤:', err);
+    res.status(500).json({ success: false, message: '伺服器內部錯誤' });
+  }
+});
+
+// 🚚 師傅的配送清單：回傳尚未送達的訂單，並附上可直接點開的導航連結。
+// 目前還沒有經緯度，所以順序就是下單先後（舊的排前面），沒有做路徑最佳化。
+// 之後要加最佳化時，只要換掉這裡的排序邏輯，前端不用動。
+app.get('/api/route', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from(ORDER_TABLE)
+      .select('*')
+      .order('created_at', { ascending: true }); // 先下單的先送
+
+    if (error) {
+      console.error('Supabase 撈取配送清單失敗:', error);
+      return res.status(500).json({ success: false, message: error.message });
+    }
+
+    // status 要正規化之後才能篩，資料表裡存的可能是帶引號的 'completed'
+    const pending = (data || []).filter((row) => normalizeStatus(row.status) !== 'completed');
+
+    const stops = [];
+    const unroutable = [];
+
+    for (const row of pending) {
+      const address = String(row.address || '').trim();
+      const base = {
+        order_id: row.id,
+        order_no: `ORD-${String(row.id).padStart(3, '0')}`,
+        customer_name: row.customer_name || '未填寫',
+        address,
+        gas_weight: row.gas_weight,
+        quantity: Number(row.quantity) || 1,
+        status: normalizeStatus(row.status)
+      };
+
+      // 地址是空的就導不了航。這種單子絕對不能默默消失，
+      // 否則師傅根本不知道有這一單，客人就收不到瓦斯。
+      if (!address) {
+        unroutable.push({ ...base, reason: 'missing_address' });
+      } else {
+        stops.push({ ...base, seq: stops.length + 1, maps_url: mapsUrlFor(address) });
+      }
+    }
+
+    // 把整條路線一次丟給 Google Maps：最後一站當終點，其餘當中繼點。
+    // Google 不會幫忙重排順序，它就照我們給的順序走。
+    let fullRouteUrl = null;
+    let truncated = false;
+
+    if (stops.length >= 2) {
+      const usable = stops.slice(0, MAX_WAYPOINTS + 1);
+      truncated = stops.length > usable.length;
+      const destination = usable[usable.length - 1].address;
+      const waypoints = usable.slice(0, -1).map((stop) => stop.address);
+      fullRouteUrl =
+        'https://www.google.com/maps/dir/?api=1&travelmode=driving' +
+        '&destination=' + encodeURIComponent(destination) +
+        '&waypoints=' + waypoints.map(encodeURIComponent).join('|');
+    } else if (stops.length === 1) {
+      fullRouteUrl = stops[0].maps_url;
+    }
+
+    res.json({
+      success: true,
+      optimized: false, // 還沒接 geocoding，順序不是最佳化過的
+      stops,
+      unroutable,
+      total_stops: stops.length,
+      full_route_maps_url: fullRouteUrl,
+      full_route_truncated: truncated
+    });
+  } catch (err) {
+    console.error('伺服器錯誤:', err);
+    res.status(500).json({ success: false, message: '伺服器內部錯誤' });
+  }
+});
+
+// 更新單筆訂單的狀態（師傅按「已送達」會打這支）
+// ⚠️ 這支目前沒有任何身分驗證，任何人知道網址就能改訂單狀態。
+//    正式對外之前一定要補上師傅白名單驗證。
+app.patch('/api/orders/:id/status', async (req, res) => {
+  try {
+    const { status } = req.body;
+
+    if (!ORDER_STATUSES.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: `status 只能是 ${ORDER_STATUSES.join(' / ')}`
+      });
+    }
+
+    const { data, error } = await supabase
+      .from(ORDER_TABLE)
+      .update({ status })
+      .eq('id', req.params.id)
+      .select();
+
+    if (error) {
+      console.error('Supabase 更新訂單狀態失敗:', error);
+      return res.status(500).json({ success: false, message: error.message });
+    }
+
+    if (!data || data.length === 0) {
+      return res.status(404).json({ success: false, message: '找不到這筆訂單' });
+    }
+
+    console.log(`📌 訂單 ${req.params.id} 狀態更新為 ${status}`);
+    res.json({ success: true, data: data[0] });
   } catch (err) {
     console.error('伺服器錯誤:', err);
     res.status(500).json({ success: false, message: '伺服器內部錯誤' });
