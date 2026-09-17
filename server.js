@@ -37,6 +37,98 @@ function mapsUrlFor(address) {
 // ⚠️ 這個數字請對照 Google Maps URLs 官方文件確認，超過的部分會被截斷。
 const MAX_WAYPOINTS = 9;
 
+// ===== LINE 身分驗證 =======================================================
+
+// 師傅白名單。多個 UID 用逗號分隔：DRIVER_UIDS=U1aad...,U2bbc...
+// 取得師傅 UID 的方法：請他加本 bot 好友並隨便傳一句話，
+// bot 的回覆裡就有他的專屬 ID，複製貼進這個環境變數即可。
+const DRIVER_UIDS = String(process.env.DRIVER_UIDS || '')
+  .split(',')
+  .map((uid) => uid.trim())
+  .filter(Boolean);
+
+// LIFF ID 的格式是「{channelId}-{suffix}」，前面那段數字就是 LINE Login
+// 的 Channel ID。一定要比對它，否則別的 channel 簽出來的 token 也會被
+// 當成合法的。（請到 LINE Developers Console 再確認一次這個數字。）
+const LINE_LOGIN_CHANNEL_ID = String(process.env.LINE_LOGIN_CHANNEL_ID || '').trim();
+
+// LINE API 的位址。獨立成變數是為了讓這段驗證邏輯能在本機用假的 LINE
+// 端點測試 —— 安全性的程式碼只靠讀是看不出漏洞的。正式環境不要設定它。
+const LINE_API_BASE = process.env.LINE_API_BASE || 'https://api.line.me';
+
+// 用 access token 向 LINE 換取真實身分。
+// ⚠️ 使用者是誰一律以這裡的回傳為準，絕不能相信前端自己送上來的 userId
+//    字串 —— UID 不是機密（本 bot 還會主動回覆給每個加好友的人），
+//    任何人都能偽造，那種做法等於把鑰匙印在門上。
+async function resolveLineUser(accessToken) {
+  // 第一步：確認 token 是 LINE 簽的、沒過期，而且屬於我們自己的 channel
+  const verifyRes = await fetch(
+    LINE_API_BASE + '/oauth2/v2.1/verify?access_token=' + encodeURIComponent(accessToken)
+  );
+
+  if (!verifyRes.ok) {
+    throw Object.assign(new Error('登入資訊無效或已過期，請重新開啟頁面'), { status: 401 });
+  }
+
+  const verified = await verifyRes.json();
+
+  if (String(verified.client_id) !== LINE_LOGIN_CHANNEL_ID) {
+    console.warn(`⛔ token 屬於其他 channel (${verified.client_id})，已拒絕`);
+    throw Object.assign(new Error('登入資訊不屬於本服務'), { status: 401 });
+  }
+
+  // 第二步：換取使用者資料，userId 從這裡拿才可信
+  const profileRes = await fetch(LINE_API_BASE + '/v2/profile', {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+
+  if (!profileRes.ok) {
+    throw Object.assign(new Error('無法取得 LINE 使用者資料'), { status: 401 });
+  }
+
+  return profileRes.json();
+}
+
+// 只放行白名單上的師傅
+async function requireDriver(req, res, next) {
+  // 設定不完整時一律擋下。安全檢查寧可整個壞掉，也不要悄悄放行。
+  if (!LINE_LOGIN_CHANNEL_ID || DRIVER_UIDS.length === 0) {
+    console.error('⛔ 尚未設定 LINE_LOGIN_CHANNEL_ID 或 DRIVER_UIDS，師傅 API 一律拒絕');
+    return res.status(500).json({
+      success: false,
+      message: '伺服器尚未設定配送人員名單，請聯絡管理者'
+    });
+  }
+
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+
+  if (!token) {
+    return res.status(401).json({ success: false, message: '缺少身分驗證資訊' });
+  }
+
+  try {
+    const profile = await resolveLineUser(token);
+
+    if (!DRIVER_UIDS.includes(profile.userId)) {
+      console.warn(`⛔ 非配送人員嘗試存取：${profile.displayName} (${profile.userId})`);
+      return res.status(403).json({
+        success: false,
+        message: '您不在配送人員名單中',
+        // 回傳他自己的 UID，方便他直接把這串字給老闆加進名單
+        line_uid: profile.userId,
+        display_name: profile.displayName
+      });
+    }
+
+    req.driver = profile;
+    next();
+  } catch (err) {
+    console.error('身分驗證失敗:', err.message);
+    res.status(err.status || 401).json({ success: false, message: err.message });
+  }
+}
+
 // 2. LINE 金鑰設定
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
@@ -205,7 +297,7 @@ app.get('/api/orders', async (req, res) => {
 // 🚚 師傅的配送清單：回傳尚未送達的訂單，並附上可直接點開的導航連結。
 // 目前還沒有經緯度，所以順序就是下單先後（舊的排前面），沒有做路徑最佳化。
 // 之後要加最佳化時，只要換掉這裡的排序邏輯，前端不用動。
-app.get('/api/route', async (req, res) => {
+app.get('/api/route', requireDriver, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from(ORDER_TABLE)
@@ -278,9 +370,7 @@ app.get('/api/route', async (req, res) => {
 });
 
 // 更新單筆訂單的狀態（師傅按「已送達」會打這支）
-// ⚠️ 這支目前沒有任何身分驗證，任何人知道網址就能改訂單狀態。
-//    正式對外之前一定要補上師傅白名單驗證。
-app.patch('/api/orders/:id/status', async (req, res) => {
+app.patch('/api/orders/:id/status', requireDriver, async (req, res) => {
   try {
     const { status } = req.body;
 
@@ -306,7 +396,7 @@ app.patch('/api/orders/:id/status', async (req, res) => {
       return res.status(404).json({ success: false, message: '找不到這筆訂單' });
     }
 
-    console.log(`📌 訂單 ${req.params.id} 狀態更新為 ${status}`);
+    console.log(`📌 訂單 ${req.params.id} 由 ${req.driver.displayName} 標記為 ${status}`);
     res.json({ success: true, data: data[0] });
   } catch (err) {
     console.error('伺服器錯誤:', err);
@@ -317,4 +407,10 @@ app.patch('/api/orders/:id/status', async (req, res) => {
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`🚀 瓦斯行後端 API 伺服器啟動於 port ${port}`);
+
+  if (!LINE_LOGIN_CHANNEL_ID || DRIVER_UIDS.length === 0) {
+    console.warn('⚠️  師傅 API 目前無法使用：請設定 LINE_LOGIN_CHANNEL_ID 與 DRIVER_UIDS');
+  } else {
+    console.log(`👷 已載入 ${DRIVER_UIDS.length} 位配送人員的白名單`);
+  }
 });
