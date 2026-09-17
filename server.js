@@ -14,6 +14,9 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
   auth: { persistSession: false }
 });
 
+// 訂單資料表名稱集中在這裡，避免寫入與讀取指到不同張表
+const ORDER_TABLE = 'gas_order';
+
 // 2. LINE 金鑰設定
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
@@ -122,7 +125,7 @@ app.post('/api/order', async (req, res) => {
     
     // 寫入 Supabase
     const { data, error } = await supabase
-      .from('gas_order')
+      .from(ORDER_TABLE)
       .insert([
         { 
           line_uid: userId, 
@@ -160,7 +163,7 @@ app.post('/api/order', async (req, res) => {
 app.get('/api/orders', async (req, res) => {
   try {
     const { data, error } = await supabase
-      .from('orders')
+      .from(ORDER_TABLE)
       .select('*')
       .order('created_at', { ascending: false }); // 讓最新建立的訂單排在最上面
 
