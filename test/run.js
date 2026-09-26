@@ -21,6 +21,8 @@ const {
   isPending,
   dayRange
 } = require('../src/routes/delivery');
+const { sortAddresses, mergeWithHistory } = require('../src/services/addressBook');
+const { normalizeAddress } = require('../src/services/geocoding');
 
 const tests = [];
 function test(name, fn) {
@@ -204,6 +206,47 @@ test('dayRange 以 +8 時區切出當天的訂單區間', () => {
   assert.strictEqual(range.from, '2026-09-09T16:00:00.000Z');
   assert.strictEqual(range.to, '2026-09-10T16:00:00.000Z');
   assert.strictEqual(dayRange('不是日期'), null);
+});
+
+// ── 客戶地址簿 ────────────────────────────────────────
+test('normalizeAddress 把全形、臺／台與空白差異視為同一個地址', () => {
+  const expected = '台北市信義區市府路1號'
+  assert.strictEqual(normalizeAddress('臺北市信義區市府路１號'), expected);
+  assert.strictEqual(normalizeAddress('  台北市 信義區 市府路1號 '), expected);
+  assert.strictEqual(normalizeAddress('台北市信義區市府路1號，'), expected);
+});
+
+test('sortAddresses 把預設地址排最前面，其餘依最近使用時間', () => {
+  const sorted = sortAddresses([
+    { address: 'A', isDefault: false, lastUsedAt: '2026-09-01T00:00:00Z' },
+    { address: 'B', isDefault: true, lastUsedAt: '2025-01-01T00:00:00Z' },
+    { address: 'C', isDefault: false, lastUsedAt: '2026-09-20T00:00:00Z' }
+  ]);
+  assert.deepStrictEqual(sorted.map((item) => item.address), ['B', 'C', 'A']);
+});
+
+test('mergeWithHistory 補進歷史訂單地址，且不會和地址簿重複', () => {
+  const saved = [
+    { address: '台北市信義區市府路1號', isDefault: true, lastUsedAt: '2026-09-20T00:00:00Z', source: 'address-book' }
+  ];
+  const history = [
+    { address: '臺北市信義區市府路１號', createdAt: '2026-09-18T00:00:00Z' }, // 同一個地址的不同寫法
+    { address: '台北市大安區和平東路二段100號', createdAt: '2026-09-19T00:00:00Z' },
+    { address: '   ', createdAt: '2026-09-19T00:00:00Z' }
+  ];
+
+  const merged = mergeWithHistory(saved, history);
+  assert.strictEqual(merged.length, 2, '重複與空白地址都不該進清單');
+  assert.strictEqual(merged[0].address, '台北市信義區市府路1號', '預設地址要排第一個');
+  assert.strictEqual(merged[1].source, 'order-history');
+});
+
+test('mergeWithHistory 在地址簿是空的時候仍然排得出清單', () => {
+  const merged = mergeWithHistory([], [
+    { address: '甲地', createdAt: '2026-09-01T00:00:00Z' },
+    { address: '乙地', createdAt: '2026-09-20T00:00:00Z' }
+  ]);
+  assert.deepStrictEqual(merged.map((item) => item.address), ['乙地', '甲地']);
 });
 
 // ── 執行 ─────────────────────────────────────────────

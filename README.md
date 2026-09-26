@@ -94,6 +94,38 @@ npm test      # 執行送貨路線的單元測試（不需要資料庫或網路�
 
 師傅送達後回報狀態：`{ "status": "pending" | "delivering" | "completed" | "cancelled" }`。
 
+---
+
+## 📒 客戶地址簿 API
+
+讓客戶叫瓦斯時不用每次重打地址，同時也讓訂單自帶座標。
+
+### 事前準備
+
+執行 [`sql/002_customer_address.sql`](./sql/002_customer_address.sql) 建立 `gas_customer_address`，
+腳本最後會把既有訂單用過的地址一次匯入，舊客戶馬上就有下拉選單可以選。
+（沒執行也不會壞：地址簿自動降級成「只列出歷史訂單地址」。）
+
+### 端點
+
+| 端點 | 說明 |
+| --- | --- |
+| `POST /api/customers/address/verify` | 檢查地址在地圖上找不找得到，回傳比對到的完整地址 |
+| `GET /api/customers/:lineUid/addresses` | 常用地址清單（預設地址排第一，並補上歷史訂單地址） |
+| `POST /api/customers/:lineUid/addresses` | 新增／更新常用地址（`{ address, label, setDefault }`） |
+| `PATCH /api/customers/:lineUid/addresses/:id` | 改標籤、改地址或設為預設 |
+| `DELETE /api/customers/:lineUid/addresses/:id` | 刪除 |
+
+### 與下單的整合
+
+`POST /api/order` 多收一個選填的 `addressLabel`，並且會：
+
+1. 把這次的地址寫進地址簿、設為預設，客戶下次開啟 LIFF 就自動帶出
+2. 存檔時順便查出經緯度，**訂單直接帶著 `lat` / `lng`**，師傅排路線時不必再做一次地理編碼
+3. 回傳 `addressVerified`，前端可以在地圖查不到地址時提醒客戶確認門牌
+
+> 用既有地址下單時不會覆寫客戶取好的標籤；訂單表還沒有 `lat` / `lng` 欄位時會自動退回只寫基本欄位。
+
 ### 演算法說明
 
 `src/services/routeOptimizer.js` 用的是實務上最常見的組合：

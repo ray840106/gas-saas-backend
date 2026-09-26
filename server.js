@@ -104,6 +104,11 @@ async function handleEvent(event) {
   });
 }
 
+// 🌟 客戶地址簿：下單時自動記住地址，並順便把地址轉成座標
+const { createAddressBook } = require('./src/services/addressBook');
+const addressBook = createAddressBook(supabase);
+const ORDERS_TABLE = process.env.ORDERS_TABLE || 'gas_order';
+
 // 🌟 1. 載入並啟用 CORS，允許前端跨網域呼叫 API
 const cors = require('cors');
 app.use(cors());
@@ -116,22 +121,39 @@ app.use(express.json());
 app.post('/api/order', async (req, res) => {
   try {
     // 從前端接收所有欄位
-    const { userId, displayName, gasWeight, quantity, address } = req.body;
+    const { userId, displayName, gasWeight, quantity, address, addressLabel = '' } = req.body;
 
     console.log(`📦 收到新訂單：${displayName} 叫了 ${quantity} 桶 ${gasWeight}kg，送到 ${address}`);
-    
+
+    // 🌟 把這次的地址記進地址簿並設為預設，客戶下次開啟 LIFF 就會自動帶出
+    //    save() 同時會查出經緯度，讓訂單自帶座標，師傅排路線時不必再查一次
+    const savedAddress = await addressBook.save(userId, {
+      address,
+      label: addressLabel,
+      setDefault: true
+    });
+
+    const orderRow = {
+      line_uid: userId,
+      customer_name: displayName,
+      gas_weight: String(gasWeight),
+      quantity: Number(quantity),
+      address: address
+    };
+    if (savedAddress && savedAddress.lat != null) {
+      orderRow.lat = savedAddress.lat;
+      orderRow.lng = savedAddress.lng;
+    }
+
     // 寫入 Supabase
-    const { data, error } = await supabase
-      .from('gas_order')
-      .insert([
-        { 
-          line_uid: userId, 
-          customer_name: displayName,
-          gas_weight: String(gasWeight),
-          quantity: Number(quantity),
-          address: address
-        }
-      ]);
+    let { error } = await supabase.from(ORDERS_TABLE).insert([orderRow]);
+
+    // 資料表還沒有 lat / lng 欄位時（尚未執行 sql/001），退回只寫基本欄位
+    if (error && /column .*"?(lat|lng)"?.* does not exist/i.test(error.message || '')) {
+      delete orderRow.lat;
+      delete orderRow.lng;
+      ({ error } = await supabase.from(ORDERS_TABLE).insert([orderRow]));
+    }
 
     if (error) throw error; 
 
@@ -148,7 +170,11 @@ app.post('/api/order', async (req, res) => {
       text: orderDetails
     });
 
-    res.status(200).json({ success: true });
+    res.status(200).json({
+      success: true,
+      // addressVerified 為 false 代表地圖查不到這個地址，前端可提醒客戶再確認一次
+      addressVerified: savedAddress ? savedAddress.verified !== false : null
+    });
 
   } catch (err) {
     console.error('❌ API 處理失敗:', err);
@@ -183,6 +209,10 @@ app.get('/api/orders', async (req, res) => {
 //    掛在 express.json() 之後，才能正確解析前端傳來的 JSON
 const { createDeliveryRouter } = require('./src/routes/delivery');
 app.use('/api/delivery', createDeliveryRouter(supabase));
+
+// 📒 5. 客戶地址簿 API（讓客戶不用每次重打地址）
+const { createCustomerRouter } = require('./src/routes/customers');
+app.use('/api/customers', createCustomerRouter(supabase, addressBook));
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
